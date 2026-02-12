@@ -7,48 +7,105 @@
 import torch
 import numpy as np
 from collections import Counter
+from model import TrajectoryTransformerWithFeatures
 
 
-def get_attention_weights(model, sequence, pad_idx):
-    """Extract attention weights from transformer."""
+def get_attention_weights(model, sample, pad_idx):
+    """Extract attention weights from transformer.
+
+    Args:
+        sample: For standard model — a single sequence tensor (T,).
+                For feature model — a tuple (cat_idx, hour, dow, tgap, dist)
+                each of shape (T,).
+    """
     model.eval()
+    is_feature_model = isinstance(model, TrajectoryTransformerWithFeatures)
+
     with torch.no_grad():
-        token_emb = model.embedding(sequence.unsqueeze(0))
-        positions = torch.arange(sequence.shape[0])
-        pos_emb = model.pos_embedding(positions)
-        x = token_emb + pos_emb
-        
+        if is_feature_model:
+            cat_idx, hour, dow, tgap, dist = sample
+            seq = cat_idx.unsqueeze(0)  # (1, T)
+            token_emb = model.embedding(seq)
+            hour_emb = model.hour_embedding(hour.unsqueeze(0))
+            dow_emb = model.dow_embedding(dow.unsqueeze(0))
+            tgap_feat = tgap.unsqueeze(0).unsqueeze(-1)
+            dist_feat = dist.unsqueeze(0).unsqueeze(-1)
+            combined = torch.cat([token_emb, hour_emb, dow_emb, tgap_feat, dist_feat], dim=-1)
+            x_proj = model.input_proj(combined)
+            positions = torch.arange(seq.shape[1])
+            pos_emb = model.pos_embedding(positions)
+            x = x_proj + pos_emb
+            pad_mask = (cat_idx == pad_idx).unsqueeze(0)
+        else:
+            sequence = sample
+            token_emb = model.embedding(sequence.unsqueeze(0))
+            positions = torch.arange(sequence.shape[0])
+            pos_emb = model.pos_embedding(positions)
+            x = token_emb + pos_emb
+            pad_mask = (sequence == pad_idx).unsqueeze(0)
+
         attn_layer = model.transformer.layers[0].self_attn
-        pad_mask = (sequence == pad_idx).unsqueeze(0)
         _, attn_weights = attn_layer(x, x, x, key_padding_mask=pad_mask, average_attn_weights=True)
-        
+
     # Return attention FROM last position TO all positions
     return attn_weights.squeeze(0)[-1].numpy()
 
 
 def analyze_attention(model, dataset, vocab, idx_to_cat, n_samples=500):
-    """Analyze attention patterns across test samples."""
+    """Analyze attention patterns across test samples (randomly sampled).
+
+    Handles both 2-tuple (standard) and 6-tuple (feature) dataset formats.
+    """
+    import random
     results = []
-    
-    for i in range(min(n_samples, len(dataset))):
-        seq, target_idx = dataset[i]
+    is_feature_model = isinstance(model, TrajectoryTransformerWithFeatures)
+    pad_idx = vocab["[PAD]"]
+
+    # Randomly sample indices to avoid single-user bias
+    indices = list(range(len(dataset)))
+    random.seed(42)
+    random.shuffle(indices)
+    indices = indices[:min(n_samples, len(dataset))]
+
+    for i in indices:
+        item = dataset[i]
+
+        if is_feature_model and len(item) == 6:
+            cat_idx, hour, dow, tgap, dist, target_idx = item
+            seq = cat_idx
+            sample_for_attn = (cat_idx, hour, dow, tgap, dist)
+
+            # Predict
+            model.eval()
+            with torch.no_grad():
+                logits = model(
+                    cat_idx.unsqueeze(0), hour.unsqueeze(0), dow.unsqueeze(0),
+                    tgap.unsqueeze(0), dist.unsqueeze(0), pad_idx=pad_idx
+                )
+                pred_idx = logits.argmax(dim=1).item()
+                pred = idx_to_cat[pred_idx]
+                confidence = torch.softmax(logits, dim=1)[0, pred_idx].item()
+        else:
+            seq, target_idx = item
+            sample_for_attn = seq
+
+            # Predict
+            model.eval()
+            with torch.no_grad():
+                logits = model(seq.unsqueeze(0), pad_idx=pad_idx)
+                pred_idx = logits.argmax(dim=1).item()
+                pred = idx_to_cat[pred_idx]
+                confidence = torch.softmax(logits, dim=1)[0, pred_idx].item()
+
         target = idx_to_cat[target_idx]
-        
-        # Predict
-        model.eval()
-        with torch.no_grad():
-            logits = model(seq.unsqueeze(0), pad_idx=vocab["[PAD]"])
-            pred_idx = logits.argmax(dim=1).item()
-            pred = idx_to_cat[pred_idx]
-            confidence = torch.softmax(logits, dim=1)[0, pred_idx].item()
-        
+
         # Get attention
-        attn = get_attention_weights(model, seq, vocab["[PAD]"])
-        
+        attn = get_attention_weights(model, sample_for_attn, pad_idx)
+
         # Map to categories
-        history = [idx_to_cat[idx.item()] for idx in seq if idx.item() != vocab["[PAD]"]]
+        history = [idx_to_cat[idx.item()] for idx in seq if idx.item() != pad_idx]
         attn_no_pad = attn[-len(history):]
-        
+
         results.append({
             "history": history,
             "target": target,
@@ -58,7 +115,7 @@ def analyze_attention(model, dataset, vocab, idx_to_cat, n_samples=500):
             "attention": dict(zip(history, attn_no_pad)),
             "attn_values": attn_no_pad
         })
-    
+
     return results
 
 

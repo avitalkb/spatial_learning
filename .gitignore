@@ -1,0 +1,10 @@
+.venv/*
+layerX/*
+.DS_Store
+cache/
+outputs/
+log.txt
+output.png
+*.pkl
+*.png
+!mobility_attention/*.ipynb
