@@ -7,4 +7,7 @@ log.txt
 output.png
 *.pkl
 *.png
+!mobility_attention/simpsons_paradox.png
+!mobility_attention/attention_path.png
+!mobility_attention/attention_path_transition.png
 !mobility_attention/*.ipynb
