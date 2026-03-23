@@ -1,0 +1,283 @@
+================================================================================
+MOBILITY ATTENTION PROJECT — FULL STORY
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+1. WHAT THIS PROJECT DOES
+────────────────────────────────────────────────────────────────────────────────
+
+Goal: Predict where a person will go next (location category) from their
+movement history, using a Transformer — and then investigate what the attention
+mechanism actually learns.
+
+Data:
+  - Gowalla (Dallas/Austin): 66,000 trajectories, 1,071 users
+  - Foursquare (Washington/Baltimore): 2,256 trajectories, 129 users
+  - 18 high-level location categories: Food, Coffee/Dessert, Bar/Nightlife,
+    Shopping, Work, Home, Transit, Entertainment, Outdoors, Hotel, Services,
+    Education, Sports, Culture, Religious, Tech, Zoo/Nature, Other
+
+Models built:
+  1. TrajectoryTransformer — baseline: sequence of location categories → predict next
+  2. TrajectoryTransformerWithFeatures — adds hour of day, day of week,
+     time gap between visits, and distance between locations
+
+Model Architecture:
+
+  Data pipeline (shared by both models):
+    - Each user's check-ins are sliced into overlapping windows of length 11–20.
+      Step size = 10, so windows overlap by half — this is standard practice to
+      get more training samples from limited data.
+    - Consecutive duplicate categories are removed (e.g. Food→Food→Bar becomes
+      Food→Bar). This prevents the model from cheating by just repeating the
+      most recent location.
+    - Categories are mapped to 18 high-level groups (e.g. "Chipotle" → "Food").
+    - From each trajectory, one sample is created per position: the input is
+      all previous categories, the target is the next one. So a trajectory of
+      length 10 produces 9 training samples.
+    - Input sequences are left-padded to a fixed length of 10. Padding tokens
+      are masked out so the model ignores them.
+    - Train/test split: 80/20 by USER (not by trajectory). Users are stratified
+      into quartiles by activity level so both sets have a similar mix of active
+      and inactive users. This prevents data leakage.
+
+  Standard TrajectoryTransformer:
+    - Input: sequence of up to 10 category indices (left-padded)
+    - Category embedding: maps each of the 18 categories to a 64-dimensional vector
+    - Positional embedding: a separate learned 64-dim vector is added for each
+      position (0–19), telling the model where in the sequence each token is
+    - These two embeddings are added together: final input = category_emb + pos_emb
+      Why add instead of concatenate? Both embeddings are 64-dimensional vectors,
+      and adding them means positional information slightly "shifts" the category
+      vector — the same category (e.g. Food) looks a little different to the model
+      depending on whether it appeared recently or early in the sequence. This is
+      the standard design from the original Transformer paper and is used in BERT,
+      GPT, and virtually every Transformer since. Concatenating would also work but
+      doubles the size and adds parameters everywhere downstream. The fact that
+      both models in this project show recency bias (attending most to recent
+      positions) confirms the positional signal is being learned correctly.
+    - Transformer Encoder: 2 layers, 4 attention heads, hidden size 64
+      Each layer applies self-attention (every position can look at every other
+      position) followed by a small feed-forward network.
+      Padding positions are masked: the model cannot attend to them.
+    - Prediction: takes only the output at the last (most recent) position,
+      passes it through a linear layer → produces a score for each of the 18
+      categories. The highest score is the prediction.
+    - Total parameters: ~565,000
+
+  TrajectoryTransformerWithFeatures (same structure + extra inputs):
+    - In addition to the category sequence, each position also has:
+        hour of day    → embedded to 8 dims  (learned, 24 possible values)
+        day of week    → embedded to 4 dims  (learned, 7 possible values)
+        time gap       → scalar in [0, 1]    (hours since previous visit, capped at 1 week)
+        distance       → scalar in [0, 1]    (km from previous location, capped at 100km)
+    - All of these are concatenated with the category embedding:
+        64 + 8 + 4 + 1 + 1 = 78 dimensions
+    - A linear projection maps 78 → 64, so the Transformer sees the same
+      shape as before. Then positional embedding is added on top — exactly
+      the same as the standard model. The features are concatenated (not added)
+      because they come from different embedding spaces with different sizes and
+      can't be directly summed. The linear projection learns how to merge them
+      into one unified 64-dim vector, and only then does position get added.
+    - The rest is identical: same 2-layer, 4-head Transformer, same classifier head.
+    - Extra parameters: ~5,500 (just the new embeddings + projection layer)
+    - Validated: padding positions receive 0 for all feature values, which is
+      consistent with the padding mask — the model will ignore them anyway.
+
+  Training setup (both models):
+    - Loss function: CrossEntropyLoss (standard classification loss)
+      A "soft" loss variant was also tried, which assigns partial credit for
+      predicting a category in the same group. It did not improve results.
+    - Optimizer: Adam, learning rate = 0.001
+    - Batch size: 64
+    - Epochs: 30
+    - Hardware: CPU (deliberately chosen — the model is small enough that
+      CPU is faster than GPU for this batch size)
+
+  How training works:
+    Each training step follows the same loop:
+      1. Feed a batch of 64 sequences through the model → get scores for
+         each of the 18 categories
+      2. Compare the top-scoring prediction to the actual next location
+         using CrossEntropyLoss
+      3. The Adam optimizer uses this error to nudge ALL parameters
+         (including embeddings) slightly in the direction that reduces the loss
+      4. Repeat for all batches, 30 times over the full dataset
+
+    Why embeddings need training (not pre-calculated):
+      - Category embeddings start random. During training, categories with
+        similar transition patterns (e.g. Coffee and Food both often followed
+        by Work) drift closer together in the 64-dimensional space. This
+        structure cannot be pre-specified — it has to be discovered from data.
+      - Positional embeddings are also learned. This is what produces the
+        recency bias observed in the results: the model discovers on its own
+        that recent positions are more predictive and adjusts accordingly.
+      - Hour and day-of-week embeddings learn non-linear structure: that 8am
+        and 9am are similar (commute), that 11pm and midnight are adjacent
+        despite being numerically far apart. A raw number 0-23 cannot capture
+        this — the embedding can.
+      - The linear projection layer (78 → 64 in the feature model) learns how
+        to weight and blend all these different signals into one representation
+        the Transformer can work with.
+
+    This is also why the two models develop different behaviors: the standard
+    model, having no temporal signal, trains its attention to act as a lookup
+    (copy the most-attended category). The feature model trains its attention
+    to act as context reading (find the position whose time/distance info is
+    most useful), because the category is already encoded separately.
+
+Results (Gowalla):
+  - Random baseline: 5.6%
+  - Most-frequent baseline: 21.9%
+  - Standard model: 28.1% test accuracy
+  - Feature model: 28.5% test accuracy (no overfitting)
+  - Foursquare: feature model severely overfits (46% train / 21% test) —
+    small dataset can't support extra parameters
+
+Key findings on attention:
+
+  1. Return visits vs. true transitions
+     ~50% of test samples are return visits (target already in history).
+     These are 3-5x easier to predict than true transitions (new categories).
+     Overall accuracy is dominated by how well the model handles return visits.
+
+  2. Simpson's Paradox
+     High-attention samples appeared to have LOWER overall accuracy than
+     low-attention samples. But this is a composition effect:
+       - High-attention samples contain more true transitions (harder, 39-45% return visits)
+       - Low-attention samples contain more return visits (easier, 58-71%)
+     Within each case type, high attention is consistently BETTER:
+       - Transitions: 13.9-15.7% (high attn) vs. 5.6-6.2% (low attn)
+     The model correctly focuses attention on harder cases. The aggregate
+     statistic hides this — classic Simpson's Paradox.
+
+  3. Standard model vs. feature model use attention differently
+     - Standard model uses attention as direct lookup: when confident,
+       it copies the most-attended category ~33% of the time (Gowalla)
+     - Feature model uses attention as context reading: only predicts the
+       most-attended category ~14% of the time — it attends to positions
+       to extract temporal/spatial information, not to copy the category
+     - Feature model attention is sharper: mean max attention 0.561 vs. 0.413
+
+  4. Recency bias: both models attend most strongly to the most recent positions
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. THE PROCESS
+────────────────────────────────────────────────────────────────────────────────
+
+Feb 5 — Starting out
+  Started exploring the two datasets. Noticed that many Gowalla users have only
+  1-2 check-ins — a data quality issue worth tracking. Ran EDA on trajectory
+  lengths and unique categories per user.
+
+  First training runs were extremely slow: Foursquare Soft Loss ~400 minutes,
+  Gowalla Hard Loss ~170 minutes. Found a vectorization bug — the soft loss was
+  computing a loop over targets instead of using matrix operations. Fixed it.
+
+  Training curves didn't look good: small improvement, and test accuracy was
+  higher than train — which shouldn't happen. First sign something was wrong
+  structurally.
+
+Feb 6-7 — The model isn't learning
+  Questioned why a higher learning rate would help (it wouldn't). Noticed the
+  soft loss wasn't better than the hard loss despite having fewer categories —
+  unexpected. Kept asking: "why was train worse than test?"
+
+Feb 7-8 — Catching the test set bug
+  Identified that the test set was being sampled from the same users as
+  training. Not just overlapping trajectories — the same people. This meant the
+  model could memorize user-specific habits and inflate test accuracy.
+  Fixed the split to be user-level: train users and test users are disjoint.
+
+  Also identified that consecutive duplicate locations (Food → Food → Food → Bar)
+  created loops in the data, allowing the model to cheat by repeating the last
+  category. Added deduplication of consecutive repeats.
+
+Feb 8-9 — Adding features, cleaning up
+  After fixing the bugs, improvement was smaller than expected. Asked whether
+  the dataset had unused features — it did: timestamps and coordinates.
+  Added hour of day, day of week, time gap between visits, and distance.
+
+  Also created a clean analysis notebook separating EDA, baseline model, and
+  feature model — the original had become too messy to reason about.
+
+Feb 10-11 — Deep attention investigation
+  Ran detailed attention analysis comparing correct vs. wrong predictions.
+  Noticed something strange: in the feature model, high attention was NOT better
+  overall. This seemed paradoxical — more focused attention should help.
+
+  Pushed for a return-visit vs. true-transition breakdown. That was the key.
+  The model was concentrating attention on the harder cases (true transitions),
+  which dragged down the high-attention group's overall average even though it
+  was doing exactly the right thing.
+
+  Caught another subtle bug: even after user-level splitting, the 1000-row
+  sample used for attention analysis was mostly from one user. Fixed the
+  sampling to be random across users.
+
+  Noticed training curves were still odd — test starting higher than train,
+  then diverging. Investigated whether the trajectory construction (first-to-last
+  vs. other slicing) was the cause.
+
+Feb 11-12 — Finishing and writing up
+  Final session: confirmed the Simpson's Paradox framing, added conclusions
+  to the notebook, generated attention path visualizations (showing side-by-side
+  how standard vs. feature model attend on the same trajectory), committed and
+  pushed. Then wrote the LinkedIn post.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3. LINKEDIN POST
+────────────────────────────────────────────────────────────────────────────────
+
+Out of my comfort zone. Here's what I learned.
+
+I spent the last few weeks doing something I normally wouldn't — building a
+Transformer model to predict where people go next, using real check-in data
+(Gowalla & Foursquare). This is not my main domain. I did it with Claude.
+
+It worked. But the most interesting part wasn't the model — it was what I had
+to catch myself.
+
+Claude is an incredible coding partner. It built the data pipeline, the training
+loop, the attention visualizations. Fast and clean. But at every stage, I found
+myself stopping to ask: "Wait, is this actually right?"
+
+Some things I caught through critical thinking:
+  - The data had loops — consecutive duplicate locations that let the model
+    "cheat" by just predicting the most recent category
+  - The test set was sampled from the same users as training. That's data
+    leakage. The split needs to be by user, not by trajectory
+  - The model wasn't learning — not because of the architecture, but because
+    of how the sequences were constructed
+  - Even after fixing the user split, the attention analysis sample was still
+    dominated by a single user
+
+None of these were flagged automatically. They required me to feel the data.
+
+The actual finding (which is genuinely cool):
+
+Adding temporal features (hour, day-of-week, distance, time gap) changes how
+the model uses attention — not just how well it predicts. The baseline model
+uses attention like a lookup: when confident, it copies the most-attended
+location ~33% of the time. The feature model uses attention as context — it
+attends sharply to positions not to copy them, but to extract when and where.
+Same architecture. Completely different behavior.
+
+Also: high-attention samples had lower overall accuracy. Turns out that's
+Simpson's Paradox — the model focuses attention on harder cases (new
+destinations), which drags down the group average even though attention is
+helping exactly where it should.
+
+The takeaway: Use AI to go faster. Use your brain to go right.
+
+(And maybe next week, Claude will be able to catch those bugs too.
+I'm not betting against it.)
+
+Figures to include:
+  - attention_path_transition.png  (side-by-side attention on a real trajectory)
+  - simpsons_paradox.png           (the paradox broken down by case type)
+
+================================================================================

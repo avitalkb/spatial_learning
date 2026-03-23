@@ -1,0 +1,48 @@
+
+Out of my comfort zone. Here's what I learned.
+
+I spent the last few weeks doing something I normally wouldn't — building a
+Transformer model to predict where people go next, using real check-in data
+(Gowalla & Foursquare). This is not my main domain. I did it with Claude.
+
+It worked. But the most interesting part wasn't the model — it was what I had
+to catch myself.
+
+Claude is an incredible coding partner. It built the data pipeline, the training
+loop, the attention visualizations. Fast and clean. But at every stage, I found
+myself stopping to ask: "Wait, is this actually right?"
+
+Some things I caught through critical thinking:
+  - The data had loops — consecutive duplicate locations that let the model
+    "cheat" by just predicting the most recent category
+  - The test set was sampled from the same users as training. That's data
+    leakage. The split needs to be by user, not by trajectory
+  - The model wasn't learning — not because of the architecture, but because
+    of how the sequences were constructed
+  - Even after fixing the user split, the attention analysis sample was still
+    dominated by a single user
+
+None of these were flagged automatically. They required me to feel the data.
+
+The actual finding (which is genuinely cool):
+
+Adding temporal features (hour, day-of-week, distance, time gap) changes how
+the model uses attention — not just how well it predicts. The baseline model
+uses attention like a lookup: when confident, it copies the most-attended
+location ~33% of the time. The feature model uses attention as context — it
+attends sharply to positions not to copy them, but to extract when and where.
+Same architecture. Completely different behavior.
+
+Also: high-attention samples had lower overall accuracy. Turns out that's
+Simpson's Paradox — the model focuses attention on harder cases (new
+destinations), which drags down the group average even though attention is
+helping exactly where it should.
+
+The takeaway: Use AI to go faster. Use your brain to go right.
+
+(And maybe next week, Claude will be able to catch those bugs too.
+I'm not betting against it.)
+
+Figures to include:
+  - attention_path_transition.png  (side-by-side attention on a real trajectory)
+  - simpsons_paradox.png           (the paradox broken down by case type)
